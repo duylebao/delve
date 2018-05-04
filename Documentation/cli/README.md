@@ -5,6 +5,7 @@ Command | Description
 [args](#args) | Print function arguments.
 [break](#break) | Sets a breakpoint.
 [breakpoints](#breakpoints) | Print out info for active breakpoints.
+[call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
 [check](#check) | Creates a checkpoint at the current position.
 [checkpoints](#checkpoints) | Print out info for existing checkpoints.
 [clear](#clear) | Deletes breakpoint.
@@ -67,6 +68,10 @@ Aliases: b
 Print out info for active breakpoints.
 
 Aliases: bp
+
+## call
+Resumes process, injecting a function call (EXPERIMENTAL!!!)
+
 
 ## check
 Creates a checkpoint at the current position.

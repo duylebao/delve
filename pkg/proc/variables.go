@@ -147,6 +147,7 @@ type G struct {
 	stkbarVar  *Variable // stkbar field of g struct
 	stkbarPos  int       // stkbarPos field of g struct
 	stackhi    uint64    // value of stack.hi
+	stacklo    uint64    // value of stack.lo
 
 	SystemStack bool // SystemStack is true if this goroutine is currently executing on a system stack.
 
@@ -362,11 +363,6 @@ func (scope *EvalScope) DwarfReader() *reader.Reader {
 	return scope.BinInfo.DwarfReader()
 }
 
-// Type returns the Dwarf type entry at `offset`.
-func (scope *EvalScope) Type(offset dwarf.Offset) (godwarf.Type, error) {
-	return godwarf.ReadType(scope.BinInfo.dwarf, offset, scope.BinInfo.typeCache)
-}
-
 // PtrSize returns the size of a pointer.
 func (scope *EvalScope) PtrSize() int {
 	return scope.BinInfo.Arch.PtrSize()
@@ -431,10 +427,13 @@ func (gvar *Variable) parseG() (*G, error) {
 		}
 
 	}
-	var stackhi uint64
+	var stackhi, stacklo uint64
 	if stackVar := gvar.fieldVariable("stack"); stackVar != nil {
 		if stackhiVar := stackVar.fieldVariable("hi"); stackhiVar != nil {
 			stackhi, _ = constant.Uint64Val(stackhiVar.Value)
+		}
+		if stackloVar := stackVar.fieldVariable("lo"); stackloVar != nil {
+			stacklo, _ = constant.Uint64Val(stackloVar.Value)
 		}
 	}
 
@@ -460,6 +459,7 @@ func (gvar *Variable) parseG() (*G, error) {
 		stkbarVar:  stkbarVar,
 		stkbarPos:  int(stkbarPos),
 		stackhi:    stackhi,
+		stacklo:    stacklo,
 	}
 	return g, nil
 }
@@ -705,10 +705,20 @@ func (scope *EvalScope) findGlobal(name string) (*Variable, error) {
 			return scope.extractVarInfoFromEntry(entry)
 		}
 	}
+	for _, fn := range scope.BinInfo.Functions {
+		if fn.Name == name || strings.HasSuffix(fn.Name, "/"+name) {
+			//TODO(aarzilli): convert function entry into a function type?
+			r := scope.newVariable(fn.Name, uintptr(fn.Entry), &godwarf.FuncType{}, scope.Mem)
+			r.Value = constant.MakeString(fn.Name)
+			r.Base = uintptr(fn.Entry)
+			r.loaded = true
+			return r, nil
+		}
+	}
 	for offset, ctyp := range scope.BinInfo.consts {
 		for _, cval := range ctyp.values {
 			if cval.fullName == name || strings.HasSuffix(cval.fullName, "/"+name) {
-				t, err := scope.Type(offset)
+				t, err := scope.BinInfo.Type(offset)
 				if err != nil {
 					return nil, err
 				}
@@ -799,6 +809,27 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 	}
 }
 
+func readVarEntry(varEntry *dwarf.Entry, bi *BinaryInfo) (entry reader.Entry, name string, typ godwarf.Type, err error) {
+	entry, _ = reader.LoadAbstractOrigin(varEntry, bi.dwarfReader)
+
+	name, ok := entry.Val(dwarf.AttrName).(string)
+	if !ok {
+		return nil, "", nil, fmt.Errorf("malformed variable DIE (name)")
+	}
+
+	offset, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+	if !ok {
+		return nil, "", nil, fmt.Errorf("malformed variable DIE (offset)")
+	}
+
+	typ, err = bi.Type(offset)
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	return entry, name, typ, nil
+}
+
 // Extracts the name and type of a variable from a dwarf entry
 // then executes the instructions given in the  DW_AT_location attribute to grab the variable's address
 func (scope *EvalScope) extractVarInfoFromEntry(varEntry *dwarf.Entry) (*Variable, error) {
@@ -810,19 +841,7 @@ func (scope *EvalScope) extractVarInfoFromEntry(varEntry *dwarf.Entry) (*Variabl
 		return nil, fmt.Errorf("invalid entry tag, only supports FormalParameter and Variable, got %s", varEntry.Tag.String())
 	}
 
-	entry, _ := reader.LoadAbstractOrigin(varEntry, scope.BinInfo.dwarfReader)
-
-	n, ok := entry.Val(dwarf.AttrName).(string)
-	if !ok {
-		return nil, fmt.Errorf("type assertion failed")
-	}
-
-	offset, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
-	if !ok {
-		return nil, fmt.Errorf("type assertion failed")
-	}
-
-	t, err := scope.Type(offset)
+	entry, n, t, err := readVarEntry(varEntry, scope.BinInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -1119,6 +1138,7 @@ func (v *Variable) loadChanInfo() {
 	if sv.Unreadable != nil || sv.Addr == 0 {
 		return
 	}
+	v.Base = sv.Addr
 	structType, ok := sv.DwarfType.(*godwarf.StructType)
 	if !ok {
 		v.Unreadable = errors.New("bad channel type")
