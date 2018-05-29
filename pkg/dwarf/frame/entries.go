@@ -17,6 +17,7 @@ type CommonInformationEntry struct {
 	DataAlignmentFactor   int64
 	ReturnAddressRegister uint64
 	InitialInstructions   []byte
+	staticBase            uint64
 }
 
 // Represents a Frame Descriptor Entry in the

@@ -408,7 +408,7 @@ func GoroutinesInfo(dbp Process) ([]*G, error) {
 		}
 	}
 
-	addr, err := rdr.AddrFor("runtime.allglen")
+	addr, err := rdr.AddrFor("runtime.allglen", dbp.BinInfo().staticBase)
 	if err != nil {
 		return nil, err
 	}
@@ -420,10 +420,10 @@ func GoroutinesInfo(dbp Process) ([]*G, error) {
 	allglen := binary.LittleEndian.Uint64(allglenBytes)
 
 	rdr.Seek(0)
-	allgentryaddr, err := rdr.AddrFor("runtime.allgs")
+	allgentryaddr, err := rdr.AddrFor("runtime.allgs", dbp.BinInfo().staticBase)
 	if err != nil {
 		// try old name (pre Go 1.6)
-		allgentryaddr, err = rdr.AddrFor("runtime.allg")
+		allgentryaddr, err = rdr.AddrFor("runtime.allg", dbp.BinInfo().staticBase)
 		if err != nil {
 			return nil, err
 		}

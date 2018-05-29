@@ -265,11 +265,12 @@ func readCore(corePath, exePath string) (*Core, error) {
 	if err != nil {
 		return nil, err
 	}
-	memory := buildMemory(coreFile, exe, notes)
+	memory, memoryMap := buildMemory(coreFile, exe, notes)
 
 	core := &Core{
 		MemoryReader: memory,
 		Threads:      map[int]*Thread{},
+		memoryMap:    memoryMap,
 	}
 
 	var lastThread *Thread
@@ -294,6 +295,8 @@ type Core struct {
 	proc.MemoryReader
 	Threads map[int]*Thread
 	Pid     int
+
+	memoryMap []proc.MemoryMapEntry
 }
 
 // Note is a note from the PT_NOTE prog.
@@ -376,7 +379,7 @@ func readNote(r io.ReadSeeker) (*Note, error) {
 		// No good documentation reference, but the structure is
 		// simply a header, including entry count, followed by that
 		// many entries, and then the file name of each entry,
-		// null-delimited. Not reading the names here.
+		// null-delimited.
 		data := &LinuxNTFile{}
 		if err := binary.Read(descReader, binary.LittleEndian, &data.LinuxNTFileHdr); err != nil {
 			return nil, fmt.Errorf("reading NT_FILE header: %v", err)
@@ -384,9 +387,25 @@ func readNote(r io.ReadSeeker) (*Note, error) {
 		for i := 0; i < int(data.Count); i++ {
 			entry := &LinuxNTFileEntry{}
 			if err := binary.Read(descReader, binary.LittleEndian, entry); err != nil {
-				return nil, fmt.Errorf("reading NT_PRPSINFO entry %v: %v", i, err)
+				return nil, fmt.Errorf("reading NT_FILE entry %v: %v", i, err)
 			}
 			data.entries = append(data.entries, entry)
+		}
+		data.entryNames = make([]string, len(data.entries))
+		buf := []byte{}
+		for i := 0; i < int(data.Count); i++ {
+			for {
+				b, err := descReader.ReadByte()
+				if err != nil {
+					return nil, fmt.Errorf("reading NT_FILE filename %d: %v", i, err)
+				}
+				if b == 0x00 {
+					break
+				}
+				buf = append(buf, b)
+			}
+			data.entryNames[i] = string(buf)
+			buf = buf[:0]
 		}
 		note.Desc = data
 	case NT_X86_XSTATE:
@@ -417,19 +436,27 @@ func skipPadding(r io.ReadSeeker, pad int64) error {
 	return nil
 }
 
-func buildMemory(core *elf.File, exe io.ReaderAt, notes []*Note) proc.MemoryReader {
+func buildMemory(core *elf.File, exe io.ReaderAt, notes []*Note) (proc.MemoryReader, []proc.MemoryMapEntry) {
 	memory := &SplicedMemory{}
+	var memoryMap []proc.MemoryMapEntry
 
 	// For now, assume all file mappings are to the exe.
 	for _, note := range notes {
 		if note.Type == NT_FILE {
 			fileNote := note.Desc.(*LinuxNTFile)
-			for _, entry := range fileNote.entries {
+			memoryMap = make([]proc.MemoryMapEntry, 0, len(fileNote.entries))
+			for i, entry := range fileNote.entries {
 				r := &OffsetReaderAt{
 					reader: exe,
 					offset: uintptr(entry.Start - (entry.FileOfs * fileNote.PageSize)),
 				}
 				memory.Add(r, uintptr(entry.Start), uintptr(entry.End-entry.Start))
+				memoryMap = append(memoryMap, proc.MemoryMapEntry{
+					Low:    entry.Start,
+					High:   entry.End,
+					Offset: entry.FileOfs * fileNote.PageSize,
+					Path:   fileNote.entryNames[i],
+				})
 			}
 
 		}
@@ -446,7 +473,7 @@ func buildMemory(core *elf.File, exe io.ReaderAt, notes []*Note) proc.MemoryRead
 			memory.Add(r, uintptr(prog.Vaddr), uintptr(prog.Filesz))
 		}
 	}
-	return memory
+	return memory, memoryMap
 }
 
 // Various structures from the ELF spec and the Linux kernel.
@@ -486,7 +513,8 @@ type LinuxSiginfo struct {
 
 type LinuxNTFile struct {
 	LinuxNTFileHdr
-	entries []*LinuxNTFileEntry
+	entries    []*LinuxNTFileEntry
+	entryNames []string
 }
 
 type LinuxNTFileHdr struct {

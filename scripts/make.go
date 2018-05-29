@@ -16,7 +16,7 @@ import (
 const DelveMainPackagePath = "github.com/derekparker/delve/cmd/dlv"
 
 var Backend string
-var Verbose, AllBackends bool
+var Verbose, AllBackendsAndBuildmodes bool
 
 func NewMakeCommands() *cobra.Command {
 	RootCommand := &cobra.Command{
@@ -48,7 +48,7 @@ func NewMakeCommands() *cobra.Command {
 		Run:   testFullCmd,
 	}
 	test.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "verbose tests")
-	test.PersistentFlags().BoolVarP(&AllBackends, "all", "a", true, "tests all backends")
+	test.PersistentFlags().BoolVarP(&AllBackendsAndBuildmodes, "all", "a", true, "tests all backends and build modes")
 	RootCommand.AddCommand(test)
 
 	testBackend := &cobra.Command{
@@ -56,7 +56,16 @@ func NewMakeCommands() *cobra.Command {
 		Short: "Test one backend",
 		Run:   testBackendCmd,
 	}
+	testBackend.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "verbose tests")
 	RootCommand.AddCommand(testBackend)
+
+	testBuildmode := &cobra.Command{
+		Use:   "test-buildmode <buildmode>",
+		Short: "Test one buildmode",
+		Run:   testBuildmodeCmd,
+	}
+	testBuildmode.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "verbose tests")
+	RootCommand.AddCommand(testBuildmode)
 
 	testProc := &cobra.Command{
 		Use:   "test-proc-run <test pattern>",
@@ -212,27 +221,37 @@ func testFullCmd(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	defaultBackend := "native"
-	if runtime.GOOS == "darwin" {
-		defaultBackend = "lldb"
-	}
-	os.Setenv("PROCTEST", defaultBackend)
+	os.Setenv("PROCTEST", defaultBackend())
 
 	executeq("go", "test", testFlags(), buildFlags(), allPackages())
 
-	if !AllBackends {
+	if !AllBackendsAndBuildmodes {
 		return
 	}
 
 	if inpath("lldb-server") {
 		fmt.Println("\nTesting LLDB backend")
-		testBackend("lldb")
+		testReduced("lldb", "", shortPackageSet)
 	}
 
 	if inpath("rr") {
 		fmt.Println("\nTesting RR backend")
-		testBackend("rr")
+		testReduced("rr", "", shortPackageSet)
 	}
+
+	if runtime.GOOS == "linux" {
+		fmt.Println("\nTesting PIE build mode")
+		execute("go", "test", testFlags(), buildFlags(), procPackage, corePackage, "-test-buildmode=pie")
+	}
+
+	fmt.Println("\nDone")
+}
+
+func defaultBackend() string {
+	if runtime.GOOS == "darwin" {
+		return "lldb"
+	}
+	return "native"
 }
 
 func inpath(exe string) bool {
@@ -253,8 +272,13 @@ func allPackages() []string {
 	return r
 }
 
-func testBackend(backend string) {
-	execute("go", "test", testFlags(), buildFlags(), "github.com/derekparker/delve/pkg/proc", "github.com/derekparker/delve/service/test", "github.com/derekparker/delve/pkg/terminal", "-backend="+backend)
+const procPackage = "github.com/derekparker/delve/pkg/proc"
+const corePackage = "github.com/derekparker/delve/pkg/proc/core"
+
+var shortPackageSet = []string{procPackage, "github.com/derekparker/delve/service/test", "github.com/derekparker/delve/pkg/terminal"}
+
+func testReduced(backend, buildmode string, packages []string) {
+	execute("go", "test", testFlags(), buildFlags(), packages, "-backend="+backend, "-test-buildmode="+buildmode)
 }
 
 func testBackendCmd(cmd *cobra.Command, args []string) {
@@ -263,7 +287,17 @@ func testBackendCmd(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "wrong number of arguments\n")
 		os.Exit(1)
 	}
-	testBackend(args[0])
+	testReduced(args[0], "", shortPackageSet)
+}
+
+func testBuildmodeCmd(cmd *cobra.Command, args []string) {
+	if len(args) != 1 {
+		fmt.Fprintf(os.Stderr, "wrong number of arguments\n")
+		os.Exit(1)
+	}
+	testReduced(defaultBackend(), args[0], shortPackageSet)
+	execute("go", "test", testFlags(), buildFlags(), corePackage, "-test-buildmode=pie")
+	execute("go", "test", testFlags(), buildFlags(), procPackage, "-backend=rr")
 }
 
 func testProcCmd(cmd *cobra.Command, args []string) {

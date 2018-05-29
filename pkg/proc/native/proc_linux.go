@@ -1,6 +1,7 @@
 package native
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -469,6 +470,42 @@ func (dbp *Process) detach(kill bool) error {
 		sys.Kill(dbp.pid, sys.SIGCONT)
 	}
 	return nil
+}
+
+func (dbp *Process) memoryMap() ([]proc.MemoryMapEntry, error) {
+	fh, err := os.Open(fmt.Sprintf("/proc/%d/maps", dbp.pid))
+	if err != nil {
+		return nil, fmt.Errorf("could not read memory map: %v", err)
+	}
+	defer fh.Close()
+	r := []proc.MemoryMapEntry{}
+	scan := bufio.NewScanner(fh)
+	for scan.Scan() {
+		line := scan.Text()
+		fields := strings.SplitN(line, " ", 6)
+		dash := strings.Index(fields[0], "-")
+		if dash < 0 {
+			return nil, fmt.Errorf("malformed memory map file: %q", line)
+		}
+		path := strings.TrimSpace(fields[5])
+		lowaddr, err := strconv.ParseUint(fields[0][:dash], 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed memory map file (low addr): %v", err)
+		}
+		highaddr, err := strconv.ParseUint(fields[0][dash+1:], 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed memory map file (high addr): %v", err)
+		}
+		offset, err := strconv.ParseUint(fields[2], 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed memory map file (offset): %v", err)
+		}
+		r = append(r, proc.MemoryMapEntry{lowaddr, highaddr, offset, path})
+	}
+	if err := scan.Err(); err != nil {
+		return nil, fmt.Errorf("could not read memory map: %v", err)
+	}
+	return r, nil
 }
 
 func killProcess(pid int) error {

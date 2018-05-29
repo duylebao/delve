@@ -40,7 +40,7 @@ func BenchmarkFDEForPC(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	fdes := Parse(data, binary.BigEndian)
+	fdes := Parse(data, binary.BigEndian, 0)
 
 	for i := 0; i < b.N; i++ {
 		// bench worst case, exhaustive search

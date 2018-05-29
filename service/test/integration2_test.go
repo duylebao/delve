@@ -16,6 +16,7 @@ import (
 	protest "github.com/derekparker/delve/pkg/proc/test"
 
 	"github.com/derekparker/delve/pkg/goversion"
+	"github.com/derekparker/delve/pkg/logflags"
 	"github.com/derekparker/delve/service"
 	"github.com/derekparker/delve/service/api"
 	"github.com/derekparker/delve/service/rpc2"
@@ -23,10 +24,13 @@ import (
 )
 
 var normalLoadConfig = api.LoadConfig{true, 1, 64, 64, -1}
-var testBackend string
+var testBackend, buildMode string
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&testBackend, "backend", "", "selects backend")
+	flag.StringVar(&buildMode, "test-buildmode", "", "selects build mode")
+	var logOutput string
+	flag.StringVar(&logOutput, "log-output", "", "configures log output")
 	flag.Parse()
 	if testBackend == "" {
 		testBackend = os.Getenv("PROCTEST")
@@ -34,10 +38,15 @@ func TestMain(m *testing.M) {
 			testBackend = "native"
 		}
 	}
+	if buildMode != "" && buildMode != "pie" {
+		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
+		os.Exit(1)
+	}
+	logflags.Setup(logOutput != "", logOutput)
 	os.Exit(protest.RunTestsWithFixtures(m))
 }
 
-func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
+func withTestClient2(name string, t *testing.T, fn func(c service.Client, fixture protest.Fixture)) {
 	if testBackend == "rr" {
 		protest.MustHaveRecordingAllowed(t)
 	}
@@ -46,9 +55,14 @@ func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
 		t.Fatalf("couldn't start listener: %s\n", err)
 	}
 	defer listener.Close()
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags = protest.BuildModePIE
+	}
+	fixture := protest.BuildFixture(name, buildFlags)
 	server := rpccommon.NewServer(&service.Config{
 		Listener:    listener,
-		ProcessArgs: []string{protest.BuildFixture(name, 0).Path},
+		ProcessArgs: []string{fixture.Path},
 		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err != nil {
@@ -63,7 +77,7 @@ func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
 		}
 	}()
 
-	fn(client)
+	fn(client, fixture)
 }
 
 func TestRunWithInvalidPath(t *testing.T) {
@@ -90,7 +104,7 @@ func TestRunWithInvalidPath(t *testing.T) {
 }
 
 func TestRestart_afterExit(t *testing.T) {
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		origPid := c.ProcessPid()
 		state := <-c.Continue()
 		if !state.Exited {
@@ -111,7 +125,7 @@ func TestRestart_afterExit(t *testing.T) {
 
 func TestRestart_breakpointPreservation(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 1, Name: "firstbreakpoint", Tracepoint: true})
 		assertNoError(err, t, "CreateBreakpoint()")
 		stateCh := c.Continue()
@@ -140,7 +154,7 @@ func TestRestart_breakpointPreservation(t *testing.T) {
 }
 
 func TestRestart_duringStop(t *testing.T) {
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		origPid := c.ProcessPid()
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 1})
 		if err != nil {
@@ -182,7 +196,7 @@ func TestRestart_attachPid(t *testing.T) {
 
 func TestClientServer_exit(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		state, err := c.GetState()
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -206,7 +220,7 @@ func TestClientServer_exit(t *testing.T) {
 
 func TestClientServer_step(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testprog", t, func(c service.Client) {
+	withTestClient2("testprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -230,7 +244,7 @@ func TestClientServer_step(t *testing.T) {
 
 func TestClientServer_stepout(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		stateBefore := <-c.Continue()
@@ -248,7 +262,7 @@ func TestClientServer_stepout(t *testing.T) {
 
 func testnext2(testcases []nextTest, initialLocation string, t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: initialLocation, Line: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -340,7 +354,7 @@ func TestNextFunctionReturn(t *testing.T) {
 
 func TestClientServer_breakpointInMainThread(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testprog", t, func(c service.Client) {
+	withTestClient2("testprog", t, func(c service.Client, fixture protest.Fixture) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: 1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -362,7 +376,7 @@ func TestClientServer_breakpointInMainThread(t *testing.T) {
 
 func TestClientServer_breakpointInSeparateGoroutine(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testthreads", t, func(c service.Client) {
+	withTestClient2("testthreads", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.anotherthread", Line: 1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -381,7 +395,7 @@ func TestClientServer_breakpointInSeparateGoroutine(t *testing.T) {
 }
 
 func TestClientServer_breakAtNonexistentPoint(t *testing.T) {
-	withTestClient2("testprog", t, func(c service.Client) {
+	withTestClient2("testprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "nowhere", Line: 1})
 		if err == nil {
 			t.Fatal("Should not be able to break at non existent function")
@@ -390,7 +404,7 @@ func TestClientServer_breakAtNonexistentPoint(t *testing.T) {
 }
 
 func TestClientServer_clearBreakpoint(t *testing.T) {
-	withTestClient2("testprog", t, func(c service.Client) {
+	withTestClient2("testprog", t, func(c service.Client, fixture protest.Fixture) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sleepytime", Line: 1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
@@ -417,7 +431,7 @@ func TestClientServer_clearBreakpoint(t *testing.T) {
 
 func TestClientServer_switchThread(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		// With invalid thread id
 		_, err := c.SwitchThread(-1)
 		if err == nil {
@@ -461,7 +475,7 @@ func TestClientServer_switchThread(t *testing.T) {
 
 func TestClientServer_infoLocals(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		fp := testProgPath(t, "testnextprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 23})
 		if err != nil {
@@ -483,7 +497,7 @@ func TestClientServer_infoLocals(t *testing.T) {
 
 func TestClientServer_infoArgs(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		fp := testProgPath(t, "testnextprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 47})
 		if err != nil {
@@ -512,7 +526,7 @@ func TestClientServer_infoArgs(t *testing.T) {
 
 func TestClientServer_traceContinue(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("integrationprog", t, func(c service.Client) {
+	withTestClient2("integrationprog", t, func(c service.Client, fixture protest.Fixture) {
 		fp := testProgPath(t, "integrationprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 15, Tracepoint: true, Goroutine: true, Stacktrace: 5, Variables: []string{"i"}})
 		if err != nil {
@@ -570,7 +584,7 @@ func TestClientServer_traceContinue(t *testing.T) {
 
 func TestClientServer_traceContinue2(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("integrationprog", t, func(c service.Client) {
+	withTestClient2("integrationprog", t, func(c service.Client, fixture protest.Fixture) {
 		bp1, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 1, Tracepoint: true})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v\n", err)
@@ -613,7 +627,7 @@ func TestClientServer_traceContinue2(t *testing.T) {
 }
 
 func TestClientServer_FindLocations(t *testing.T) {
-	withTestClient2("locationsprog", t, func(c service.Client) {
+	withTestClient2("locationsprog", t, func(c service.Client, fixture protest.Fixture) {
 		someFunctionCallAddr := findLocationHelper(t, c, "locationsprog.go:26", false, 1, 0)[0]
 		someFunctionLine1 := findLocationHelper(t, c, "locationsprog.go:27", false, 1, 0)[0]
 		findLocationHelper(t, c, "anotherFunction:1", false, 1, someFunctionLine1)
@@ -662,35 +676,34 @@ func TestClientServer_FindLocations(t *testing.T) {
 		findLocationHelper(t, c, `*amap["k"]`, false, 1, findLocationHelper(t, c, `amap["k"]`, false, 1, 0)[0])
 	})
 
-	withTestClient2("testnextdefer", t, func(c service.Client) {
+	withTestClient2("testnextdefer", t, func(c service.Client, fixture protest.Fixture) {
 		firstMainLine := findLocationHelper(t, c, "testnextdefer.go:5", false, 1, 0)[0]
 		findLocationHelper(t, c, "main.main", false, 1, firstMainLine)
 	})
 
-	withTestClient2("stacktraceprog", t, func(c service.Client) {
+	withTestClient2("stacktraceprog", t, func(c service.Client, fixture protest.Fixture) {
 		stacktracemeAddr := findLocationHelper(t, c, "stacktraceprog.go:4", false, 1, 0)[0]
 		findLocationHelper(t, c, "main.stacktraceme", false, 1, stacktracemeAddr)
 	})
 
-	withTestClient2("locationsUpperCase", t, func(c service.Client) {
+	withTestClient2("locationsUpperCase", t, func(c service.Client, fixture protest.Fixture) {
 		// Upper case
 		findLocationHelper(t, c, "locationsUpperCase.go:6", false, 1, 0)
 
 		// Fully qualified path
-		path := protest.Fixtures[protest.FixtureKey{"locationsUpperCase", 0}].Source
-		findLocationHelper(t, c, path+":6", false, 1, 0)
-		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: path, Line: 6})
+		findLocationHelper(t, c, fixture.Source+":6", false, 1, 0)
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: fixture.Source, Line: 6})
 		if err != nil {
-			t.Fatalf("Could not set breakpoint in %s: %v\n", path, err)
+			t.Fatalf("Could not set breakpoint in %s: %v\n", fixture.Source, err)
 		}
 		c.ClearBreakpoint(bp.ID)
 
 		//  Allow `/` or `\` on Windows
 		if runtime.GOOS == "windows" {
-			findLocationHelper(t, c, filepath.FromSlash(path)+":6", false, 1, 0)
-			bp, err = c.CreateBreakpoint(&api.Breakpoint{File: filepath.FromSlash(path), Line: 6})
+			findLocationHelper(t, c, filepath.FromSlash(fixture.Source)+":6", false, 1, 0)
+			bp, err = c.CreateBreakpoint(&api.Breakpoint{File: filepath.FromSlash(fixture.Source), Line: 6})
 			if err != nil {
-				t.Fatalf("Could not set breakpoint in %s: %v\n", filepath.FromSlash(path), err)
+				t.Fatalf("Could not set breakpoint in %s: %v\n", filepath.FromSlash(fixture.Source), err)
 			}
 			c.ClearBreakpoint(bp.ID)
 		}
@@ -702,17 +715,17 @@ func TestClientServer_FindLocations(t *testing.T) {
 			shouldWrongCaseBeError = false
 			numExpectedMatches = 1
 		}
-		findLocationHelper(t, c, strings.ToLower(path)+":6", shouldWrongCaseBeError, numExpectedMatches, 0)
-		bp, err = c.CreateBreakpoint(&api.Breakpoint{File: strings.ToLower(path), Line: 6})
+		findLocationHelper(t, c, strings.ToLower(fixture.Source)+":6", shouldWrongCaseBeError, numExpectedMatches, 0)
+		bp, err = c.CreateBreakpoint(&api.Breakpoint{File: strings.ToLower(fixture.Source), Line: 6})
 		if (err == nil) == shouldWrongCaseBeError {
-			t.Fatalf("Could not set breakpoint in %s: %v\n", strings.ToLower(path), err)
+			t.Fatalf("Could not set breakpoint in %s: %v\n", strings.ToLower(fixture.Source), err)
 		}
 		c.ClearBreakpoint(bp.ID)
 	})
 }
 
 func TestClientServer_FindLocationsAddr(t *testing.T) {
-	withTestClient2("locationsprog2", t, func(c service.Client) {
+	withTestClient2("locationsprog2", t, func(c service.Client, fixture protest.Fixture) {
 		<-c.Continue()
 
 		afunction := findLocationHelper(t, c, "main.afunction", false, 1, 0)[0]
@@ -729,14 +742,14 @@ func TestClientServer_FindLocationsExactMatch(t *testing.T) {
 	// In this example "math/rand.Intn" would normally match "math/rand.Intn"
 	// and "math/rand.(*Rand).Intn" but since the first match is exact it
 	// should be prioritized.
-	withTestClient2("locationsprog3", t, func(c service.Client) {
+	withTestClient2("locationsprog3", t, func(c service.Client, fixture protest.Fixture) {
 		<-c.Continue()
 		findLocationHelper(t, c, "math/rand.Intn", false, 1, 0)
 	})
 }
 
 func TestClientServer_EvalVariable(t *testing.T) {
-	withTestClient2("testvariables", t, func(c service.Client) {
+	withTestClient2("testvariables", t, func(c service.Client, fixture protest.Fixture) {
 		state := <-c.Continue()
 
 		if state.Err != nil {
@@ -755,7 +768,7 @@ func TestClientServer_EvalVariable(t *testing.T) {
 }
 
 func TestClientServer_SetVariable(t *testing.T) {
-	withTestClient2("testvariables", t, func(c service.Client) {
+	withTestClient2("testvariables", t, func(c service.Client, fixture protest.Fixture) {
 		state := <-c.Continue()
 
 		if state.Err != nil {
@@ -781,7 +794,7 @@ func TestClientServer_SetVariable(t *testing.T) {
 
 func TestClientServer_FullStacktrace(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("goroutinestackprog", t, func(c service.Client) {
+	withTestClient2("goroutinestackprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.stacktraceme", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		state := <-c.Continue()
@@ -855,7 +868,7 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 func TestIssue355(t *testing.T) {
 	// After the target process has terminated should return an error but not crash
 	protest.AllowRecording(t)
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		ch := c.Continue()
@@ -920,7 +933,7 @@ func TestDisasm(t *testing.T) {
 	// Tests that disassembly by current PC will return a disassembly containing the instruction at PC
 	// Tests that stepping on a calculated CALL instruction will yield a disassembly that contains the
 	// effective destination of the CALL instruction
-	withTestClient2("locationsprog2", t, func(c service.Client) {
+	withTestClient2("locationsprog2", t, func(c service.Client, fixture protest.Fixture) {
 		ch := c.Continue()
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
@@ -1023,7 +1036,7 @@ func TestDisasm(t *testing.T) {
 func TestNegativeStackDepthBug(t *testing.T) {
 	// After the target process has terminated should return an error but not crash
 	protest.AllowRecording(t)
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		ch := c.Continue()
@@ -1036,7 +1049,7 @@ func TestNegativeStackDepthBug(t *testing.T) {
 
 func TestClientServer_CondBreakpoint(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("parallel_next", t, func(c service.Client) {
+	withTestClient2("parallel_next", t, func(c service.Client, fixture protest.Fixture) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: 1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		bp.Cond = "n == 7"
@@ -1066,7 +1079,7 @@ func TestClientServer_CondBreakpoint(t *testing.T) {
 }
 
 func TestSkipPrologue(t *testing.T) {
-	withTestClient2("locationsprog2", t, func(c service.Client) {
+	withTestClient2("locationsprog2", t, func(c service.Client, fixture protest.Fixture) {
 		<-c.Continue()
 
 		afunction := findLocationHelper(t, c, "main.afunction", false, 1, 0)[0]
@@ -1082,7 +1095,7 @@ func TestSkipPrologue(t *testing.T) {
 }
 
 func TestSkipPrologue2(t *testing.T) {
-	withTestClient2("callme", t, func(c service.Client) {
+	withTestClient2("callme", t, func(c service.Client, fixture protest.Fixture) {
 		callme := findLocationHelper(t, c, "main.callme", false, 1, 0)[0]
 		callmeZ := findLocationHelper(t, c, "main.callme:0", false, 1, 0)[0]
 		findLocationHelper(t, c, "callme.go:5", false, 1, callme)
@@ -1118,7 +1131,7 @@ func TestSkipPrologue2(t *testing.T) {
 func TestIssue419(t *testing.T) {
 	// Calling service/rpc.(*Client).Halt could cause a crash because both Halt and Continue simultaneously
 	// try to read 'runtime.g' and debug/dwarf.Data.Type is not thread safe
-	withTestClient2("issue419", t, func(c service.Client) {
+	withTestClient2("issue419", t, func(c service.Client, fixture protest.Fixture) {
 		go func() {
 			rand.Seed(time.Now().Unix())
 			d := time.Duration(rand.Intn(4) + 1)
@@ -1134,7 +1147,7 @@ func TestIssue419(t *testing.T) {
 
 func TestTypesCommand(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testvariables2", t, func(c service.Client) {
+	withTestClient2("testvariables2", t, func(c service.Client, fixture protest.Fixture) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 		types, err := c.ListTypes("")
@@ -1161,7 +1174,7 @@ func TestTypesCommand(t *testing.T) {
 
 func TestIssue406(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("issue406", t, func(c service.Client) {
+	withTestClient2("issue406", t, func(c service.Client, fixture protest.Fixture) {
 		locs, err := c.FindLocation(api.EvalScope{-1, 0}, "issue406.go:146")
 		assertNoError(err, t, "FindLocation()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{Addr: locs[0].PC})
@@ -1177,7 +1190,7 @@ func TestIssue406(t *testing.T) {
 }
 
 func TestEvalExprName(t *testing.T) {
-	withTestClient2("testvariables2", t, func(c service.Client) {
+	withTestClient2("testvariables2", t, func(c service.Client, fixture protest.Fixture) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
@@ -1206,7 +1219,7 @@ func TestClientServer_Issue528(t *testing.T) {
 		return
 	}
 
-	withTestClient2("issue528", t, func(c service.Client) {
+	withTestClient2("issue528", t, func(c service.Client, fixture protest.Fixture) {
 		findLocationHelper(t, c, "State.Close", false, 1, 0)
 	})
 }
@@ -1232,7 +1245,7 @@ func TestClientServer_FpRegisters(t *testing.T) {
 		{"XMM8", "0x4059999a404ccccd4059999a404ccccd"},
 	}
 	protest.AllowRecording(t)
-	withTestClient2("fputest/", t, func(c service.Client) {
+	withTestClient2("fputest/", t, func(c service.Client, fixture protest.Fixture) {
 		<-c.Continue()
 		regs, err := c.ListRegisters(0, true)
 		assertNoError(err, t, "ListRegisters()")
@@ -1258,7 +1271,10 @@ func TestClientServer_FpRegisters(t *testing.T) {
 
 func TestClientServer_RestartBreakpointPosition(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("locationsprog2", t, func(c service.Client) {
+	if buildMode == "pie" {
+		t.Skip("not meaningful in PIE mode")
+	}
+	withTestClient2("locationsprog2", t, func(c service.Client, fixture protest.Fixture) {
 		bpBefore, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.afunction", Line: -1, Tracepoint: true, Name: "this"})
 		addrBefore := bpBefore.Addr
 		t.Logf("%x\n", bpBefore.Addr)
@@ -1288,7 +1304,7 @@ func TestClientServer_SelectedGoroutineLoc(t *testing.T) {
 	// the thread running the goroutine, not the position the goroutine was in
 	// the last time it was parked.
 	protest.AllowRecording(t)
-	withTestClient2("testprog", t, func(c service.Client) {
+	withTestClient2("testprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -11})
 		assertNoError(err, t, "CreateBreakpoint")
 
@@ -1312,7 +1328,7 @@ func TestClientServer_ReverseContinue(t *testing.T) {
 	if testBackend != "rr" {
 		t.Skip("backend is not rr")
 	}
-	withTestClient2("continuetestprog", t, func(c service.Client) {
+	withTestClient2("continuetestprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint(main.main)")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
@@ -1343,7 +1359,7 @@ func TestClientServer_ReverseContinue(t *testing.T) {
 
 func TestClientServer_collectBreakpointInfoOnNext(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{
 			Addr:       findLocationHelper(t, c, "testnextprog.go:23", false, 1, 0)[0],
 			Variables:  []string{"j"},
@@ -1377,7 +1393,7 @@ func TestClientServer_collectBreakpointInfoOnNext(t *testing.T) {
 
 func TestClientServer_collectBreakpointInfoError(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestClient2("testnextprog", t, func(c service.Client) {
+	withTestClient2("testnextprog", t, func(c service.Client, fixture protest.Fixture) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{
 			Addr:       findLocationHelper(t, c, "testnextprog.go:23", false, 1, 0)[0],
 			Variables:  []string{"nonexistentvariable", "j"},
@@ -1393,7 +1409,7 @@ func TestClientServerConsistentExit(t *testing.T) {
 	// exit with the same exit status and details when the target application terminates.
 	// Other program execution API calls should also behave in the same way.
 	// An error should be present in state.Err.
-	withTestClient2("pr1055", t, func(c service.Client) {
+	withTestClient2("pr1055", t, func(c service.Client, fixture protest.Fixture) {
 		fp := testProgPath(t, "pr1055")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 12})
 		if err != nil {

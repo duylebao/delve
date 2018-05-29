@@ -57,6 +57,7 @@ const (
 	EnableCGOOptimization
 	EnableInlining
 	EnableDWZCompression
+	BuildModePIE
 )
 
 func BuildFixture(name string, flags BuildFlags) Fixture {
@@ -101,6 +102,9 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 	buildFlags = append(buildFlags, gcflags, "-o", tmpfile)
 	if *EnableRace {
 		buildFlags = append(buildFlags, "-race")
+	}
+	if flags&BuildModePIE != 0 {
+		buildFlags = append(buildFlags, "-buildmode=pie")
 	}
 	if path != "" {
 		buildFlags = append(buildFlags, name+".go")

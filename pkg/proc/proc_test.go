@@ -28,7 +28,7 @@ import (
 )
 
 var normalLoadConfig = proc.LoadConfig{true, 1, 64, 64, -1}
-var testBackend string
+var testBackend, buildMode string
 
 func init() {
 	runtime.GOMAXPROCS(4)
@@ -37,12 +37,17 @@ func init() {
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&testBackend, "backend", "", "selects backend")
+	flag.StringVar(&buildMode, "test-buildmode", "", "selects build mode")
 	flag.Parse()
 	if testBackend == "" {
 		testBackend = os.Getenv("PROCTEST")
 		if testBackend == "" {
 			testBackend = "native"
 		}
+	}
+	if buildMode != "" && buildMode != "pie" {
+		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
+		os.Exit(1)
 	}
 	os.Exit(protest.RunTestsWithFixtures(m))
 }
@@ -52,6 +57,9 @@ func withTestProcess(name string, t testing.TB, fn func(p proc.Process, fixture 
 }
 
 func withTestProcessArgs(name string, t testing.TB, wd string, args []string, buildFlags protest.BuildFlags, fn func(p proc.Process, fixture protest.Fixture)) {
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
 	fixture := protest.BuildFixture(name, buildFlags)
 	var p proc.Process
 	var err error
@@ -1833,7 +1841,7 @@ func TestPackageVariables(t *testing.T) {
 		assertNoError(err, t, "PackageVariables()")
 		failed := false
 		for _, v := range vars {
-			if v.Unreadable != nil {
+			if v.Unreadable != nil && v.Unreadable.Error() != "no location attribute Location" {
 				failed = true
 				t.Logf("Unreadable variable %s: %v", v.Name, v.Unreadable)
 			}
@@ -2787,7 +2795,11 @@ func TestAttachDetach(t *testing.T) {
 	if testBackend == "rr" {
 		return
 	}
-	fixture := protest.BuildFixture("testnextnethttp", 0)
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	fixture := protest.BuildFixture("testnextnethttp", buildFlags)
 	cmd := exec.Command(fixture.Path)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -3080,6 +3092,9 @@ func TestAttachStripped(t *testing.T) {
 	if runtime.GOOS == "darwin" {
 		t.Log("-s does not produce stripped executables on macOS")
 		return
+	}
+	if buildMode != "" {
+		t.Skip("not enabled with buildmode=PIE")
 	}
 	fixture := protest.BuildFixture("testnextnethttp", protest.LinkStrip)
 	cmd := exec.Command(fixture.Path)

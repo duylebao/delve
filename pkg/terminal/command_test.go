@@ -22,16 +22,21 @@ import (
 	"github.com/derekparker/delve/service/rpccommon"
 )
 
-var testBackend string
+var testBackend, buildMode string
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&testBackend, "backend", "", "selects backend")
+	flag.StringVar(&buildMode, "test-buildmode", "", "selects build mode")
 	flag.Parse()
 	if testBackend == "" {
 		testBackend = os.Getenv("PROCTEST")
 		if testBackend == "" {
 			testBackend = "native"
 		}
+	}
+	if buildMode != "" && buildMode != "pie" {
+		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
+		os.Exit(1)
 	}
 	os.Exit(test.RunTestsWithFixtures(m))
 }
@@ -103,9 +108,13 @@ func withTestTerminal(name string, t testing.TB, fn func(*FakeTerminal)) {
 		t.Fatalf("couldn't start listener: %s\n", err)
 	}
 	defer listener.Close()
+	var buildFlags test.BuildFlags
+	if buildMode == "pie" {
+		buildFlags = test.BuildModePIE
+	}
 	server := rpccommon.NewServer(&service.Config{
 		Listener:    listener,
-		ProcessArgs: []string{test.BuildFixture(name, 0).Path},
+		ProcessArgs: []string{test.BuildFixture(name, buildFlags).Path},
 		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err != nil {

@@ -35,6 +35,8 @@ type DebugLineInfo struct {
 
 	// logSuppressedErrors enables logging of otherwise suppressed errors
 	logSuppressedErrors bool
+
+	staticBase uint64
 }
 
 type FileEntry struct {
@@ -47,7 +49,7 @@ type FileEntry struct {
 type DebugLines []*DebugLineInfo
 
 // ParseAll parses all debug_line segments found in data
-func ParseAll(data []byte) DebugLines {
+func ParseAll(data []byte, staticBase uint64) DebugLines {
 	var (
 		lines = make(DebugLines, 0)
 		buf   = bytes.NewBuffer(data)
@@ -55,7 +57,7 @@ func ParseAll(data []byte) DebugLines {
 
 	// We have to parse multiple file name tables here.
 	for buf.Len() > 0 {
-		lines = append(lines, Parse("", buf))
+		lines = append(lines, Parse("", buf, staticBase))
 	}
 
 	return lines
@@ -63,8 +65,9 @@ func ParseAll(data []byte) DebugLines {
 
 // Parse parses a single debug_line segment from buf. Compdir is the
 // DW_AT_comp_dir attribute of the associated compile unit.
-func Parse(compdir string, buf *bytes.Buffer) *DebugLineInfo {
+func Parse(compdir string, buf *bytes.Buffer, staticBase uint64) *DebugLineInfo {
 	dbl := new(DebugLineInfo)
+	dbl.staticBase = staticBase
 	dbl.Lookup = make(map[string]*FileEntry)
 	if compdir != "" {
 		dbl.IncludeDirs = append(dbl.IncludeDirs, compdir)

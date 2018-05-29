@@ -213,13 +213,17 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 			if compdir != "" {
 				cu.Name = filepath.Join(compdir, cu.Name)
 			}
-			if ranges, _ := bi.dwarf.Ranges(entry); len(ranges) == 1 {
-				cu.LowPC = ranges[0][0]
-				cu.HighPC = ranges[0][1]
+			cu.Ranges, _ = bi.dwarf.Ranges(entry)
+			for i := range cu.Ranges {
+				cu.Ranges[i][0] += bi.staticBase
+				cu.Ranges[i][1] += bi.staticBase
+			}
+			if len(cu.Ranges) >= 1 {
+				cu.LowPC = cu.Ranges[0][0]
 			}
 			lineInfoOffset, _ := entry.Val(dwarf.AttrStmtList).(int64)
 			if lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
-				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]))
+				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), bi.staticBase)
 				cu.lineInfo.LogSuppressedErrors(logflags.DebugLineErrors())
 			}
 			cu.producer, _ = entry.Val(dwarf.AttrProducer).(string)
@@ -312,7 +316,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 				}
 			}
 			if off, ok := entry.Val(godwarf.AttrGoRuntimeType).(uint64); ok {
-				bi.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset, -1}
+				bi.runtimeTypeToDIE[off+bi.staticBase] = runtimeTypeDIE{entry.Offset, -1}
 			}
 			reader.SkipChildren()
 
@@ -325,12 +329,12 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 					}
 				}
 				if pu != nil {
-					pu.variables = append(pu.variables, packageVar{n, entry.Offset, addr})
+					pu.variables = append(pu.variables, packageVar{n, entry.Offset, addr + bi.staticBase})
 				} else {
 					if !cu.isgo {
 						n = "C." + n
 					}
-					bi.packageVars = append(bi.packageVars, packageVar{n, entry.Offset, addr})
+					bi.packageVars = append(bi.packageVars, packageVar{n, entry.Offset, addr + bi.staticBase})
 				}
 			}
 
@@ -359,8 +363,8 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 			var lowpc, highpc uint64
 			if ranges, _ := bi.dwarf.Ranges(entry); len(ranges) == 1 {
 				ok1 = true
-				lowpc = ranges[0][0]
-				highpc = ranges[0][1]
+				lowpc = ranges[0][0] + bi.staticBase
+				highpc = ranges[0][1] + bi.staticBase
 			}
 			name, ok2 := entry.Val(dwarf.AttrName).(string)
 			if ok1 && ok2 {

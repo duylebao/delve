@@ -290,7 +290,7 @@ func (p *Process) Connect(conn net.Conn, path string, pid int, foreground bool) 
 	}
 
 	var wg sync.WaitGroup
-	err = p.bi.LoadBinaryInfo(path, &wg)
+	err = p.bi.LoadBinaryInfo(path, nil, &wg)
 	wg.Wait()
 	if err == nil {
 		err = p.bi.LoadError()

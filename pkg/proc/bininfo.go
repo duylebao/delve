@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,8 @@ type BinaryInfo struct {
 
 	GOOS   string
 	closer io.Closer
+
+	staticBase uint64
 
 	// Maps package names to package paths, needed to lookup types inside DWARF info
 	packageMap map[string]string
@@ -77,13 +80,14 @@ var UnsupportedDarwinArchErr = errors.New("unsupported architecture - only darwi
 const dwarfGoLanguage = 22 // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
 
 type compileUnit struct {
-	entry         *dwarf.Entry        // debug_info entry describing this compile unit
-	isgo          bool                // true if this is the go compile unit
-	Name          string              // univocal name for non-go compile units
-	lineInfo      *line.DebugLineInfo // debug_line segment associated with this compile unit
-	LowPC, HighPC uint64
-	optimized     bool   // this compile unit is optimized
-	producer      string // producer attribute
+	entry     *dwarf.Entry        // debug_info entry describing this compile unit
+	isgo      bool                // true if this is the go compile unit
+	Name      string              // univocal name for non-go compile units
+	lineInfo  *line.DebugLineInfo // debug_line segment associated with this compile unit
+	LowPC     uint64
+	Ranges    [][2]uint64
+	optimized bool   // this compile unit is optimized
+	producer  string // producer attribute
 }
 
 type partialUnitConstant struct {
@@ -93,11 +97,11 @@ type partialUnitConstant struct {
 }
 
 type partialUnit struct {
-	entry       *dwarf.Entry
-	types       map[string]dwarf.Offset
-	variables   []packageVar
-	constants   []partialUnitConstant
-	functions   []Function
+	entry     *dwarf.Entry
+	types     map[string]dwarf.Offset
+	variables []packageVar
+	constants []partialUnitConstant
+	functions []Function
 }
 
 // Function describes a function in the target program.
@@ -256,7 +260,13 @@ func NewBinaryInfo(goos, goarch string) BinaryInfo {
 	return r
 }
 
-func (bininfo *BinaryInfo) LoadBinaryInfo(path string, wg *sync.WaitGroup) error {
+type MemoryMapEntry struct {
+	Low, High uint64
+	Offset    uint64
+	Path      string
+}
+
+func (bininfo *BinaryInfo) LoadBinaryInfo(path string, memoryMap []MemoryMapEntry, wg *sync.WaitGroup) error {
 	fi, err := os.Stat(path)
 	if err == nil {
 		bininfo.lastModified = fi.ModTime()
@@ -264,13 +274,14 @@ func (bininfo *BinaryInfo) LoadBinaryInfo(path string, wg *sync.WaitGroup) error
 
 	switch bininfo.GOOS {
 	case "linux":
-		return bininfo.LoadBinaryInfoElf(path, wg)
+		return bininfo.LoadBinaryInfoElf(path, memoryMap, wg)
 	case "windows":
-		return bininfo.LoadBinaryInfoPE(path, wg)
+		return bininfo.LoadBinaryInfoPE(path, memoryMap, wg)
 	case "darwin":
-		return bininfo.LoadBinaryInfoMacho(path, wg)
+		return bininfo.LoadBinaryInfoMacho(path, memoryMap, wg)
 	}
 	return errors.New("unsupported operating system")
+	return nil
 }
 
 // GStructOffset returns the offset of the G
@@ -373,7 +384,7 @@ func (bi *BinaryInfo) LoadFromData(dwdata *dwarf.Data, debugFrameBytes, debugLin
 	bi.dwarf = dwdata
 
 	if debugFrameBytes != nil {
-		bi.frameEntries = frame.Parse(debugFrameBytes, frame.DwarfEndian(debugFrameBytes))
+		bi.frameEntries = frame.Parse(debugFrameBytes, frame.DwarfEndian(debugFrameBytes), bi.staticBase)
 	}
 
 	bi.loclistInit(debugLocBytes)
@@ -446,8 +457,10 @@ func (bi *BinaryInfo) loclistEntry(off int64, pc uint64) []byte {
 // findCompileUnit returns the compile unit containing address pc.
 func (bi *BinaryInfo) findCompileUnit(pc uint64) *compileUnit {
 	for _, cu := range bi.compileUnits {
-		if pc >= cu.LowPC && pc < cu.HighPC {
-			return cu
+		for _, rng := range cu.Ranges {
+			if pc >= rng[0] && pc < rng[1] {
+				return cu
+			}
 		}
 	}
 	return nil
@@ -464,7 +477,7 @@ func (bi *BinaryInfo) Producer() string {
 
 // ELF ///////////////////////////////////////////////////////////////
 
-func (bi *BinaryInfo) LoadBinaryInfoElf(path string, wg *sync.WaitGroup) error {
+func (bi *BinaryInfo) LoadBinaryInfoElf(path string, memoryMap []MemoryMapEntry, wg *sync.WaitGroup) error {
 	exe, err := os.OpenFile(path, 0, os.ModePerm)
 	if err != nil {
 		return err
@@ -477,6 +490,12 @@ func (bi *BinaryInfo) LoadBinaryInfoElf(path string, wg *sync.WaitGroup) error {
 	if elfFile.Machine != elf.EM_X86_64 {
 		return UnsupportedLinuxArchErr
 	}
+
+	bi.staticBase, err = bi.staticBaseElf(elfFile, path, memoryMap)
+	if err != nil {
+		return err
+	}
+
 	bi.dwarf, err = elfFile.DWARF()
 	if err != nil {
 		return err
@@ -514,7 +533,7 @@ func (bi *BinaryInfo) parseDebugFrameElf(exe *elf.File, wg *sync.WaitGroup) {
 			bi.setLoadError("could not get .debug_frame section: %v", err)
 			return
 		}
-		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat))
+		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat), bi.staticBase)
 	} else {
 		bi.setLoadError("could not find .debug_frame section in binary")
 		return
@@ -578,9 +597,39 @@ func (bi *BinaryInfo) setGStructOffsetElf(exe *elf.File, wg *sync.WaitGroup) {
 	bi.gStructOffset = ^(tls.Memsz) + 1 + tlsg.Value // -tls.Memsz + tlsg.Value
 }
 
+func (bi *BinaryInfo) staticBaseElf(elfFile *elf.File, path string, memoryMap []MemoryMapEntry) (uint64, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return 0, err
+	}
+	if linkdest, err := os.Readlink(path); err == nil {
+		path = linkdest
+	}
+
+	var minload *elf.Prog
+	for _, prog := range elfFile.Progs {
+		if prog.Type != elf.PT_LOAD {
+			continue
+		}
+		if minload == nil || prog.Vaddr < minload.Vaddr {
+			minload = prog
+		}
+	}
+
+	for _, mme := range memoryMap {
+		if mme.Path != path {
+			continue
+		}
+		if mme.Offset == minload.Off {
+			return mme.Low - minload.Vaddr, nil
+		}
+	}
+	return 0, nil
+}
+
 // PE ////////////////////////////////////////////////////////////////
 
-func (bi *BinaryInfo) LoadBinaryInfoPE(path string, wg *sync.WaitGroup) error {
+func (bi *BinaryInfo) LoadBinaryInfoPE(path string, memoryMap []MemoryMapEntry, wg *sync.WaitGroup) error {
 	peFile, closer, err := openExecutablePathPE(path)
 	if err != nil {
 		return err
@@ -647,7 +696,7 @@ func (bi *BinaryInfo) parseDebugFramePE(exe *pe.File, wg *sync.WaitGroup) {
 			bi.setLoadError("could not get .debug_info section: %v", err)
 			return
 		}
-		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat))
+		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat), bi.staticBase)
 	} else {
 		bi.setLoadError("could not find .debug_frame section in binary")
 		return
@@ -748,7 +797,7 @@ func getDebugLocPE(exe *pe.File) []byte {
 
 // MACH-O ////////////////////////////////////////////////////////////
 
-func (bi *BinaryInfo) LoadBinaryInfoMacho(path string, wg *sync.WaitGroup) error {
+func (bi *BinaryInfo) LoadBinaryInfoMacho(path string, memoryMap []MemoryMapEntry, wg *sync.WaitGroup) error {
 	exe, err := macho.Open(path)
 	if err != nil {
 		return err
@@ -805,7 +854,7 @@ func (bi *BinaryInfo) parseDebugFrameMacho(exe *macho.File, wg *sync.WaitGroup) 
 			bi.setLoadError("could not get .debug_info section: %v", err)
 			return
 		}
-		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat))
+		bi.frameEntries = frame.Parse(debugFrame, frame.DwarfEndian(dat), bi.staticBase)
 	} else {
 		bi.setLoadError("could not find __debug_frame section in binary")
 		return
